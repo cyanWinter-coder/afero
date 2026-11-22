@@ -17,15 +17,23 @@ import (
 // from the overlay will be used.
 //
 // When opening files for writing (Create() / OpenFile() with the right flags)
-// the operations will be done in both layers, starting with the overlay. A
-// successful read in the overlay will move the cursor position in the base layer
-// by the number of bytes read.
+// the operations will be done in both layers, starting with the base: the
+// base is the committed source of truth, so a failing base write is reported
+// before the cache layer is touched and the two views cannot fork. A
+// successful read in the overlay will move the cursor position in the base
+// layer by the number of bytes read.
 type UnionFile struct {
 	Base   File
 	Layer  File
 	Merger DirsMerger
 	off    int
 	files  []os.FileInfo
+
+	// onCommit, when set, is invoked after a mutating operation has been
+	// committed to both layers. It lets the owning union file system mark
+	// the cached entry's generation dirty so the next open re-validates the
+	// index. It is never called for a failed operation.
+	onCommit func()
 }
 
 func (f *UnionFile) Close() error {
@@ -96,13 +104,23 @@ func (f *UnionFile) Seek(o int64, w int) (pos int64, err error) {
 }
 
 func (f *UnionFile) Write(s []byte) (n int, err error) {
-	if f.Layer != nil {
-		n, err = f.Layer.Write(s)
-		if err == nil &&
-			f.Base != nil { // hmm, do we have fixed size files where a write may hit the EOF mark?
-			_, err = f.Base.Write(s)
+	if f.Base != nil && f.Layer != nil {
+		// Commit to the base first; only mirror into the cache layer after
+		// the base write succeeded, so a base failure leaves the cache view
+		// unchanged.
+		if n, err = f.Base.Write(s); err != nil {
+			return n, err
 		}
-		return n, err
+		if _, lerr := f.Layer.Write(s); err != nil {
+			return n, lerr
+		}
+		if f.onCommit != nil {
+			f.onCommit()
+		}
+		return n, nil
+	}
+	if f.Layer != nil {
+		return f.Layer.Write(s)
 	}
 	if f.Base != nil {
 		return f.Base.Write(s)
@@ -111,12 +129,20 @@ func (f *UnionFile) Write(s []byte) (n int, err error) {
 }
 
 func (f *UnionFile) WriteAt(s []byte, o int64) (n int, err error) {
-	if f.Layer != nil {
-		n, err = f.Layer.WriteAt(s, o)
-		if err == nil && f.Base != nil {
-			_, err = f.Base.WriteAt(s, o)
+	if f.Base != nil && f.Layer != nil {
+		if n, err = f.Base.WriteAt(s, o); err != nil {
+			return n, err
 		}
-		return n, err
+		if _, lerr := f.Layer.WriteAt(s, o); err != nil {
+			return n, lerr
+		}
+		if f.onCommit != nil {
+			f.onCommit()
+		}
+		return n, nil
+	}
+	if f.Layer != nil {
+		return f.Layer.WriteAt(s, o)
 	}
 	if f.Base != nil {
 		return f.Base.WriteAt(s, o)
@@ -233,12 +259,14 @@ func (f *UnionFile) Stat() (os.FileInfo, error) {
 }
 
 func (f *UnionFile) Sync() (err error) {
-	if f.Layer != nil {
-		err = f.Layer.Sync()
-		if err == nil && f.Base != nil {
-			err = f.Base.Sync()
+	if f.Base != nil && f.Layer != nil {
+		if err = f.Base.Sync(); err != nil {
+			return err
 		}
-		return err
+		return f.Layer.Sync()
+	}
+	if f.Layer != nil {
+		return f.Layer.Sync()
 	}
 	if f.Base != nil {
 		return f.Base.Sync()
@@ -247,12 +275,20 @@ func (f *UnionFile) Sync() (err error) {
 }
 
 func (f *UnionFile) Truncate(s int64) (err error) {
-	if f.Layer != nil {
-		err = f.Layer.Truncate(s)
-		if err == nil && f.Base != nil {
-			err = f.Base.Truncate(s)
+	if f.Base != nil && f.Layer != nil {
+		if err = f.Base.Truncate(s); err != nil {
+			return err
 		}
-		return err
+		if err = f.Layer.Truncate(s); err != nil {
+			return err
+		}
+		if f.onCommit != nil {
+			f.onCommit()
+		}
+		return nil
+	}
+	if f.Layer != nil {
+		return f.Layer.Truncate(s)
 	}
 	if f.Base != nil {
 		return f.Base.Truncate(s)
@@ -261,12 +297,20 @@ func (f *UnionFile) Truncate(s int64) (err error) {
 }
 
 func (f *UnionFile) WriteString(s string) (n int, err error) {
-	if f.Layer != nil {
-		n, err = f.Layer.WriteString(s)
-		if err == nil && f.Base != nil {
-			_, err = f.Base.WriteString(s)
+	if f.Base != nil && f.Layer != nil {
+		if n, err = f.Base.WriteString(s); err != nil {
+			return n, err
 		}
-		return n, err
+		if _, lerr := f.Layer.WriteString(s); lerr != nil {
+			return n, lerr
+		}
+		if f.onCommit != nil {
+			f.onCommit()
+		}
+		return n, nil
+	}
+	if f.Layer != nil {
+		return f.Layer.WriteString(s)
 	}
 	if f.Base != nil {
 		return f.Base.WriteString(s)
@@ -287,7 +331,10 @@ func copyFile(base Fs, layer Fs, name string, bfh File) error {
 		}
 	}
 
-	// Create the file on the overlay
+	// Create (or replace) the file on the overlay. Create replaces an
+	// existing cached entry with a fresh one, so new opens resolve to the
+	// committed generation while handles already open keep seeing the
+	// generation they captured.
 	lfh, err := layer.Create(name)
 	if err != nil {
 		return err
@@ -313,7 +360,11 @@ func copyFile(base Fs, layer Fs, name string, bfh File) error {
 		lfh.Close()
 		return err
 	}
-	return layer.Chtimes(name, bfi.ModTime(), bfi.ModTime())
+	if err := layer.Chtimes(name, bfi.ModTime(), bfi.ModTime()); err != nil {
+		layer.Remove(name)
+		return err
+	}
+	return nil
 }
 
 func copyToLayer(base Fs, layer Fs, name string) error {

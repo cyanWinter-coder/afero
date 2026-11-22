@@ -178,30 +178,30 @@ func (u *CopyOnWriteFs) Rename(oldname, newname string) error {
 // will be removed.
 func (u *CopyOnWriteFs) Remove(name string) error {
 	err := u.layer.Remove(name)
-	switch err {
-	case syscall.ENOENT:
-		_, err = u.base.Stat(name)
-		if err == nil {
+	if err == nil {
+		return nil
+	}
+	if u.isNotExist(err) {
+		if _, serr := u.base.Stat(name); serr == nil {
 			return syscall.EPERM
 		}
-		return syscall.ENOENT
-	default:
 		return err
 	}
+	return err
 }
 
 func (u *CopyOnWriteFs) RemoveAll(name string) error {
 	err := u.layer.RemoveAll(name)
-	switch err {
-	case syscall.ENOENT:
-		_, err = u.base.Stat(name)
-		if err == nil {
+	if err == nil {
+		return nil
+	}
+	if u.isNotExist(err) {
+		if _, serr := u.base.Stat(name); serr == nil {
 			return syscall.EPERM
 		}
-		return syscall.ENOENT
-	default:
 		return err
 	}
+	return err
 }
 
 func (u *CopyOnWriteFs) OpenFile(name string, flag int, perm os.FileMode) (File, error) {

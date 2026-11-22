@@ -2,6 +2,8 @@ package afero
 
 import (
 	"os"
+	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -23,10 +25,27 @@ type CacheOnReadFs struct {
 	base      Fs
 	layer     Fs
 	cacheTime time.Duration
+
+	// generations records, per cached path, the version of the base entry
+	// the cached copy was made from. A cached path is only reusable while
+	// the base entry still matches that version, so a replaced or rewritten
+	// source file always forces a fresh copy instead of handing out the
+	// stale handle. Pointer identity catches entry replacements; the
+	// modification time/size fingerprint catches in-place truncations that
+	// reuse the same entry (some in-memory file systems do so).
+	genMu       sync.Mutex
+	generations map[string]sourceGeneration
+}
+
+// sourceGeneration describes the base entry version a cache copy is bound to.
+type sourceGeneration struct {
+	identity interface{} // underlying entry pointer, nil when unavailable
+	modTime  time.Time
+	size     int64
 }
 
 func NewCacheOnReadFs(base Fs, layer Fs, cacheTime time.Duration) Fs {
-	return &CacheOnReadFs{base: base, layer: layer, cacheTime: cacheTime}
+	return &CacheOnReadFs{base: base, layer: layer, cacheTime: cacheTime, generations: map[string]sourceGeneration{}}
 }
 
 type cacheState int
@@ -45,10 +64,96 @@ const (
 	cacheLocal
 )
 
+// entryIdentity returns a stable identity for the directory entry backing
+// name, or nil when the file system cannot provide one.
+func entryIdentity(fs Fs, name string) interface{} {
+	if m, ok := fs.(*MemMapFs); ok {
+		fd, err := m.open(name)
+		if err != nil {
+			return nil
+		}
+		return fd
+	}
+	return nil
+}
+
+// currentGeneration snapshots the version of the base entry backing name.
+func (u *CacheOnReadFs) currentGeneration(name string) (sourceGeneration, bool) {
+	bfi, err := u.base.Stat(name)
+	if err != nil {
+		return sourceGeneration{}, false
+	}
+	return sourceGeneration{
+		identity: entryIdentity(u.base, name),
+		modTime:  bfi.ModTime(),
+		size:     bfi.Size(),
+	}, true
+}
+
+// rememberGeneration binds the cached copy of name to the base version
+// currently committed.
+func (u *CacheOnReadFs) rememberGeneration(name string) {
+	gen, ok := u.currentGeneration(name)
+	if !ok {
+		return
+	}
+	u.genMu.Lock()
+	if u.generations == nil {
+		u.generations = map[string]sourceGeneration{}
+	}
+	u.generations[name] = gen
+	u.genMu.Unlock()
+}
+
+func (u *CacheOnReadFs) forgetGeneration(name string) {
+	u.genMu.Lock()
+	delete(u.generations, name)
+	u.genMu.Unlock()
+}
+
+// renameGeneration moves the recorded version when a cached entry is renamed.
+func (u *CacheOnReadFs) renameGeneration(oldname, newname string) {
+	u.genMu.Lock()
+	if gen, ok := u.generations[oldname]; ok {
+		if u.generations == nil {
+			u.generations = map[string]sourceGeneration{}
+		}
+		u.generations[newname] = gen
+		delete(u.generations, oldname)
+	}
+	u.genMu.Unlock()
+}
+
+// generationStale reports whether the base entry of name no longer matches
+// the version the cached copy was made from.
+func (u *CacheOnReadFs) generationStale(name string) bool {
+	u.genMu.Lock()
+	gen, ok := u.generations[name]
+	u.genMu.Unlock()
+	if !ok {
+		return false
+	}
+	current, exists := u.currentGeneration(name)
+	if !exists {
+		// Base lost the file: the cached copy is now overlay-local.
+		return false
+	}
+	if gen.identity != nil && current.identity != gen.identity {
+		return true
+	}
+	return !current.modTime.Equal(gen.modTime) || current.size != gen.size
+}
+
 func (u *CacheOnReadFs) cacheStatus(name string) (state cacheState, fi os.FileInfo, err error) {
 	var lfi, bfi os.FileInfo
 	lfi, err = u.layer.Stat(name)
 	if err == nil {
+		if u.generationStale(name) {
+			// The cached copy is bound to an older source generation.
+			if bfi, berr := u.base.Stat(name); berr == nil {
+				return cacheStale, bfi, nil
+			}
+		}
 		if u.cacheTime == 0 {
 			return cacheHit, lfi, nil
 		}
@@ -72,11 +177,22 @@ func (u *CacheOnReadFs) cacheStatus(name string) (state cacheState, fi os.FileIn
 }
 
 func (u *CacheOnReadFs) copyToLayer(name string) error {
-	return copyToLayer(u.base, u.layer, name)
+	if err := copyToLayer(u.base, u.layer, name); err != nil {
+		return err
+	}
+	u.rememberGeneration(name)
+	return nil
 }
 
 func (u *CacheOnReadFs) copyFileToLayer(name string, flag int, perm os.FileMode) error {
-	return copyFileToLayer(u.base, u.layer, name, flag, perm)
+	// Refreshing the cache only needs to read the committed base version;
+	// opening the base with the caller's write flags would be rejected by a
+	// read-only base filter and serves no purpose for the copy itself.
+	if err := copyToLayer(u.base, u.layer, name); err != nil {
+		return err
+	}
+	u.rememberGeneration(name)
+	return nil
 }
 
 func (u *CacheOnReadFs) Chtimes(name string, atime, mtime time.Time) error {
@@ -150,7 +266,20 @@ func (u *CacheOnReadFs) Stat(name string) (os.FileInfo, error) {
 	switch st {
 	case cacheMiss:
 		return u.base.Stat(name)
-	default: // cacheStale has base, cacheHit and cacheLocal the layer os.FileInfo
+	case cacheStale:
+		// Keep the cache index in sync before reporting the new version.
+		// Directories are merged lazily on Open, so just report the base
+		// metadata instead of trying to copy the directory as a file.
+		if !fi.IsDir() {
+			if err := u.copyToLayer(name); err != nil {
+				return nil, err
+			}
+			if lfi, lerr := u.layer.Stat(name); lerr == nil {
+				return lfi, nil
+			}
+		}
+		return fi, nil
+	default: // cacheHit and cacheLocal use the layer os.FileInfo
 		return fi, nil
 	}
 }
@@ -171,9 +300,14 @@ func (u *CacheOnReadFs) Rename(oldname, newname string) error {
 		err = u.base.Rename(oldname, newname)
 	}
 	if err != nil {
+		// The base commit did not happen: keep both views on the old path.
 		return err
 	}
-	return u.layer.Rename(oldname, newname)
+	if lerr := u.layer.Rename(oldname, newname); lerr != nil {
+		return lerr
+	}
+	u.renameGeneration(oldname, newname)
+	return nil
 }
 
 func (u *CacheOnReadFs) Remove(name string) error {
@@ -189,7 +323,11 @@ func (u *CacheOnReadFs) Remove(name string) error {
 	if err != nil {
 		return err
 	}
-	return u.layer.Remove(name)
+	if lerr := u.layer.Remove(name); lerr != nil && !os.IsNotExist(lerr) {
+		return lerr
+	}
+	u.forgetGeneration(name)
+	return nil
 }
 
 func (u *CacheOnReadFs) RemoveAll(name string) error {
@@ -205,7 +343,26 @@ func (u *CacheOnReadFs) RemoveAll(name string) error {
 	if err != nil {
 		return err
 	}
-	return u.layer.RemoveAll(name)
+	if lerr := u.layer.RemoveAll(name); lerr != nil && !os.IsNotExist(lerr) {
+		return lerr
+	}
+	u.genMu.Lock()
+	for p := range u.generations {
+		if p == name || hasPathPrefix(p, name) {
+			delete(u.generations, p)
+		}
+	}
+	u.genMu.Unlock()
+	return nil
+}
+
+// hasPathPrefix reports whether path is name itself or a descendant of name.
+func hasPathPrefix(path, name string) bool {
+	prefix := name
+	if prefix[len(prefix)-1] != FilePathSeparator[0] {
+		prefix += FilePathSeparator
+	}
+	return len(path) >= len(prefix) && path[:len(prefix)] == prefix
 }
 
 func (u *CacheOnReadFs) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
@@ -213,24 +370,45 @@ func (u *CacheOnReadFs) OpenFile(name string, flag int, perm os.FileMode) (File,
 	if err != nil {
 		return nil, err
 	}
+	write := flag&(os.O_WRONLY|syscall.O_RDWR|os.O_APPEND|os.O_CREATE|os.O_TRUNC) != 0
 	switch st {
 	case cacheLocal, cacheHit:
 	default:
-		if err := u.copyFileToLayer(name, flag, perm); err != nil {
-			return nil, err
+		// On a cache miss with create flags the base entry does not exist
+		// yet: it is created by the base OpenFile below, so there is nothing
+		// to copy up. Otherwise refresh the cache from the committed base.
+		if !(st == cacheMiss && write) {
+			if err := u.copyFileToLayer(name, flag, perm); err != nil {
+				return nil, err
+			}
 		}
 	}
-	if flag&(os.O_WRONLY|syscall.O_RDWR|os.O_APPEND|os.O_CREATE|os.O_TRUNC) != 0 {
+	if write {
+		// Commit to the base first. Only when that succeeds may the cache
+		// layer take the write; a base failure therefore cannot leave the
+		// two layers forked.
 		bfi, err := u.base.OpenFile(name, flag, perm)
 		if err != nil {
 			return nil, err
 		}
+		if st == cacheMiss {
+			// A brand new base entry needs its parent directory in the layer
+			// before the layer open can succeed.
+			if err := u.layer.MkdirAll(filepath.Dir(name), 0o777); err != nil {
+				bfi.Close()
+				return nil, err
+			}
+		}
 		lfi, err := u.layer.OpenFile(name, flag, perm)
 		if err != nil {
-			bfi.Close() // oops, what if O_TRUNC was set and file opening in the layer failed...?
+			bfi.Close()
 			return nil, err
 		}
-		return &UnionFile{Base: bfi, Layer: lfi}, nil
+		return &UnionFile{
+			Base:     bfi,
+			Layer:    lfi,
+			onCommit: func() { u.forgetGeneration(name) },
+		}, nil
 	}
 	return u.layer.OpenFile(name, flag, perm)
 }
@@ -300,16 +478,19 @@ func (u *CacheOnReadFs) MkdirAll(name string, perm os.FileMode) error {
 }
 
 func (u *CacheOnReadFs) Create(name string) (File, error) {
+	// Base commit first, cache update second.
 	bfh, err := u.base.Create(name)
 	if err != nil {
 		return nil, err
 	}
 	lfh, err := u.layer.Create(name)
 	if err != nil {
-		// oops, see comment about OS_TRUNC above, should we remove? then we have to
-		// remember if the file did not exist before
 		bfh.Close()
 		return nil, err
 	}
-	return &UnionFile{Base: bfh, Layer: lfh}, nil
+	return &UnionFile{
+		Base:     bfh,
+		Layer:    lfh,
+		onCommit: func() { u.forgetGeneration(name) },
+	}, nil
 }
