@@ -17,9 +17,19 @@ import "sort"
 
 type DirMap map[string]*FileData
 
-func (m DirMap) Len() int           { return len(m) }
-func (m DirMap) Add(f *FileData)    { m[f.name] = f }
-func (m DirMap) Remove(f *FileData) { delete(m, f.name) }
+func (m DirMap) Len() int        { return len(m) }
+func (m DirMap) Add(f *FileData) { m[f.name] = f }
+func (m DirMap) Remove(f *FileData) {
+	// The directory is keyed by full path. A file may have been renamed since
+	// it was added, so drop whichever key actually holds it rather than only
+	// trying its current name; otherwise the parent keeps a stale entry.
+	delete(m, f.name)
+	for name, entry := range m {
+		if entry == f {
+			delete(m, name)
+		}
+	}
+}
 func (m DirMap) Files() (files []*FileData) {
 	for _, f := range m {
 		files = append(files, f)

@@ -343,35 +343,51 @@ func (m *MemMapFs) Rename(oldname, newname string) error {
 		return nil
 	}
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if _, ok := m.getData()[oldname]; ok {
-		m.mu.RUnlock()
-		m.mu.Lock()
-		err := m.unRegisterWithParent(oldname)
-		if err != nil {
-			return err
-		}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-		fileData := m.getData()[oldname]
-		mem.ChangeFileName(fileData, newname)
-		m.getData()[newname] = fileData
-
-		err = m.renameDescendants(oldname, newname)
-		if err != nil {
-			return err
-		}
-
-		delete(m.getData(), oldname)
-
-		m.registerWithParent(fileData, 0)
-		m.mu.Unlock()
-		m.mu.RLock()
-	} else {
+	data := m.getData()
+	if _, ok := data[oldname]; !ok {
 		return &os.PathError{Op: "rename", Path: oldname, Err: ErrFileNotFound}
 	}
+
+	// Unlinking the source first keeps the parent directory listings honest
+	// throughout the switch: no observer can ever see both names.
+	if err := m.unRegisterWithParent(oldname); err != nil {
+		return &os.PathError{Op: "rename", Path: oldname, Err: err}
+	}
+
+	// A replacement must actually replace: evict the displaced destination
+	// from its parent before linking the incoming file under the same name.
+	if _, ok := data[newname]; ok {
+		if err := m.unRegisterWithParent(newname); err != nil {
+			// Put the source back so a failed rename leaves both paths
+			// untouched.
+			m.registerWithParent(data[oldname], 0)
+			return &os.PathError{Op: "rename", Path: newname, Err: err}
+		}
+		delete(data, newname)
+	}
+
+	fileData := data[oldname]
+	mem.ChangeFileName(fileData, newname)
+	data[newname] = fileData
+
+	if err := m.renameDescendants(oldname, newname); err != nil {
+		return err
+	}
+
+	delete(data, oldname)
+	m.registerWithParent(fileData, 0)
 	return nil
 }
+
+// MemMapFs intentionally does not implement RecoverableRenamer: every rename
+// inside the single in-memory map already switches atomically under one write
+// lock, so the package-level RecoverableRename fast path (one Rename call)
+// applies and journaling would only add overhead. Custom filesystems that
+// embed MemMapFs therefore keep recoverable semantics without bypassing the
+// generic recovery protocol.
 
 func (m *MemMapFs) renameDescendants(oldname, newname string) error {
 	descendants := m.findDescendants(oldname)

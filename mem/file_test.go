@@ -307,3 +307,19 @@ func TestFileWriteAndSeek(t *testing.T) {
 		assert(cur == off, cur, off)
 	}
 }
+
+// TestDirMapRemoveAfterRename ensures Remove drops the entry even when the
+// FileData was renamed after being added, so its current name no longer
+// matches the full-path key it was stored under.
+func TestDirMapRemoveAfterRename(t *testing.T) {
+	m := DirMap{}
+	f := CreateFile("/dir/file.txt")
+	m.Add(f)
+
+	ChangeFileName(f, "/dir/renamed.txt")
+	m.Remove(f)
+
+	if m.Len() != 0 {
+		t.Errorf("DirMap still holds %d entry/entries after removing a renamed file: %v", m.Len(), m.Names())
+	}
+}

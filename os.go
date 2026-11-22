@@ -83,6 +83,13 @@ func (OsFs) Rename(oldname, newname string) error {
 	return os.Rename(oldname, newname)
 }
 
+// RecoverableRename keeps same-volume replacements a single atomic os.Rename
+// and falls back to the journaled copy-and-switch protocol when the two paths
+// live on different devices.
+func (o OsFs) RecoverableRename(oldname, newname string) error {
+	return genericRecoverableRename(o, oldname, newname)
+}
+
 func (OsFs) Stat(name string) (os.FileInfo, error) {
 	return os.Stat(name)
 }

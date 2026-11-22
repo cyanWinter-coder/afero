@@ -142,6 +142,19 @@ func (b *BasePathFs) Rename(oldname, newname string) (err error) {
 	return b.source.Rename(oldname, newname)
 }
 
+// RecoverableRename applies the same RealPath ownership rules as Rename and
+// delegates to the wrapped filesystem so that every journal, temporary and
+// backup file stays inside the base path.
+func (b *BasePathFs) RecoverableRename(oldname, newname string) (err error) {
+	if oldname, err = b.RealPath(oldname); err != nil {
+		return &os.PathError{Op: "rename", Path: oldname, Err: err}
+	}
+	if newname, err = b.RealPath(newname); err != nil {
+		return &os.PathError{Op: "rename", Path: newname, Err: err}
+	}
+	return RecoverableRename(b.source, oldname, newname)
+}
+
 func (b *BasePathFs) RemoveAll(name string) (err error) {
 	if name, err = b.RealPath(name); err != nil {
 		return &os.PathError{Op: "remove_all", Path: name, Err: err}

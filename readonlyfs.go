@@ -64,6 +64,12 @@ func (r *ReadOnlyFs) Rename(o, n string) error {
 	return syscall.EPERM
 }
 
+// RecoverableRename is a mutating operation and therefore rejected on a
+// read-only filesystem, matching Rename.
+func (r *ReadOnlyFs) RecoverableRename(o, n string) error {
+	return syscall.EPERM
+}
+
 func (r *ReadOnlyFs) RemoveAll(p string) error {
 	return syscall.EPERM
 }

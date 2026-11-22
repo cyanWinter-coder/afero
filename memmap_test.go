@@ -1172,3 +1172,64 @@ func TestEmptyWritePastEnd(t *testing.T) {
 		})
 	}
 }
+
+// TestMemMapFsRenameRemoveNoStaleEntry guards against the directory-entry
+// leak where a file renamed and then removed kept a stale full-path key in
+// its parent directory, so ReadDir still reported the deleted name.
+func TestMemMapFsRenameRemoveNoStaleEntry(t *testing.T) {
+	fs := NewMemMapFs()
+	dir := "/stale"
+	oldName := dir + "/old.txt"
+	newName := dir + "/new.txt"
+	writeContent(t, fs, oldName, "data")
+
+	if err := fs.Rename(oldName, newName); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if err := fs.Remove(newName); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	entries, err := ReadDir(fs, dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, e := range entries {
+		t.Errorf("directory %q still contains entry %q after rename+remove", dir, e.Name())
+	}
+
+	// The same must hold for an overwrite: the displaced destination must be
+	// gone from its parent once replaced and then removed.
+	writeContent(t, fs, dir+"/a.txt", "a")
+	writeContent(t, fs, dir+"/b.txt", "b")
+	if err := fs.Rename(dir+"/a.txt", dir+"/b.txt"); err != nil {
+		t.Fatalf("overwrite Rename: %v", err)
+	}
+	names, err := readDirNames(fs, dir)
+	if err != nil {
+		t.Fatalf("readDirNames: %v", err)
+	}
+	for _, n := range names {
+		if n == "a.txt" {
+			t.Error("overwritten source name still listed in parent directory")
+		}
+	}
+}
+
+// TestMemMapFsOverwriteReplacesContents checks that renaming over an existing
+// file replaces both the map entry and the parent directory listing atomically.
+func TestMemMapFsOverwriteReplacesContents(t *testing.T) {
+	fs := NewMemMapFs()
+	writeContent(t, fs, "/ow/from.txt", "new-bytes")
+	writeContent(t, fs, "/ow/to.txt", "old-bytes")
+
+	if err := fs.Rename("/ow/from.txt", "/ow/to.txt"); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if got := mustReadFile(t, fs, "/ow/to.txt"); got != "new-bytes" {
+		t.Errorf("destination = %q, want new-bytes", got)
+	}
+	if _, err := fs.Stat("/ow/from.txt"); !os.IsNotExist(err) {
+		t.Errorf("source Stat err = %v, want not-exist", err)
+	}
+}
