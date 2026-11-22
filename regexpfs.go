@@ -16,20 +16,42 @@ type RegexpFs struct {
 	source Fs
 }
 
+var (
+	_ CapabilityReporter = (*RegexpFs)(nil)
+	_ DeniedErrorMapper  = (*RegexpFs)(nil)
+)
+
 func NewRegexpFs(source Fs, re *regexp.Regexp) Fs {
 	return &RegexpFs{source: source, re: re}
 }
 
 type RegexpFile struct {
 	f  File
-	re *regexp.Regexp
+	fs *RegexpFs
+}
+
+// Capabilities reports the source's capabilities: the filter restricts
+// which names are visible, not which operations are supported.
+func (r *RegexpFs) Capabilities() Operation {
+	return CapabilitiesOf(r.source)
+}
+
+// DeniedError declares the error mapping of this wrapper: names rejected
+// by the filter are reported as "no such file or directory".
+func (r *RegexpFs) DeniedError(Operation) error {
+	return syscall.ENOENT
+}
+
+// matchBase is the single normalization point of the filter: it matches a
+// path base name against the regexp. Path strings are reduced to a base
+// name with filepath.Base before calling it; os.FileInfo values already
+// carry a base name in Name(), so both go through the exact same check.
+func (r *RegexpFs) matchBase(base string) bool {
+	return r.re == nil || r.re.MatchString(base)
 }
 
 func (r *RegexpFs) matchesName(name string) error {
-	if r.re == nil {
-		return nil
-	}
-	if r.re.MatchString(filepath.Base(name)) {
+	if r.matchBase(filepath.Base(name)) {
 		return nil
 	}
 	return syscall.ENOENT
@@ -84,7 +106,8 @@ func (r *RegexpFs) Rename(oldname, newname string) error {
 		return err
 	}
 	if dir {
-		return nil
+		// Directories pass the filter; still perform the rename.
+		return r.source.Rename(oldname, newname)
 	}
 	if err := r.matchesName(oldname); err != nil {
 		return err
@@ -142,7 +165,7 @@ func (r *RegexpFs) Open(name string) (File, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &RegexpFile{f: f, re: r.re}, nil
+	return &RegexpFile{f: f, fs: r}, nil
 }
 
 func (r *RegexpFs) Mkdir(n string, p os.FileMode) error {
@@ -195,7 +218,9 @@ func (f *RegexpFile) Readdir(c int) (fi []os.FileInfo, err error) {
 		return nil, err
 	}
 	for _, i := range rfi {
-		if i.IsDir() || f.re.MatchString(i.Name()) {
+		// FileInfo.Name() is already a base name, so it goes through
+		// the same normalization as filtered paths.
+		if i.IsDir() || f.fs.matchBase(i.Name()) {
 			fi = append(fi, i)
 		}
 	}

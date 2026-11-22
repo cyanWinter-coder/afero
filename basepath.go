@@ -11,10 +11,11 @@ import (
 )
 
 var (
-	_ Lstater        = (*BasePathFs)(nil)
-	_ fs.ReadDirFile = (*BasePathFile)(nil)
-	_ io.WriterTo    = (*BasePathFile)(nil)
-	_ io.ReaderFrom  = (*BasePathFile)(nil)
+	_ Lstater            = (*BasePathFs)(nil)
+	_ CapabilityReporter = (*BasePathFs)(nil)
+	_ fs.ReadDirFile     = (*BasePathFile)(nil)
+	_ io.WriterTo        = (*BasePathFile)(nil)
+	_ io.ReaderFrom      = (*BasePathFile)(nil)
 )
 
 // The BasePathFs restricts all operations to a given path within an Fs.
@@ -63,6 +64,13 @@ func (f *BasePathFile) ReadFrom(r io.Reader) (int64, error) {
 
 func NewBasePathFs(source Fs, path string) Fs {
 	return &BasePathFs{source: source, path: path}
+}
+
+// Capabilities reports the source's capabilities: the base path
+// restriction limits which paths are reachable, not which operations are
+// supported.
+func (b *BasePathFs) Capabilities() Operation {
+	return CapabilitiesOf(b.source)
 }
 
 // on a file outside the base path it returns the given file name and an error,

@@ -1,6 +1,7 @@
 package afero
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,7 +9,10 @@ import (
 	"time"
 )
 
-var _ Lstater = (*CopyOnWriteFs)(nil)
+var (
+	_ Lstater            = (*CopyOnWriteFs)(nil)
+	_ CapabilityReporter = (*CopyOnWriteFs)(nil)
+)
 
 // The CopyOnWriteFs is a union filesystem: a read only base file system with
 // a possibly writeable layer on top. Changes to the file system will only
@@ -24,6 +28,13 @@ type CopyOnWriteFs struct {
 
 func NewCopyOnWriteFs(base Fs, layer Fs) Fs {
 	return &CopyOnWriteFs{base: base, layer: layer}
+}
+
+// Capabilities reports the intersection of both layers' capabilities:
+// reads may hit either layer and writes go to the overlay, so the union
+// never supports an operation one of its layers denies.
+func (u *CopyOnWriteFs) Capabilities() Operation {
+	return CapabilitiesOf(u.base) & CapabilitiesOf(u.layer)
 }
 
 // Returns true if the file is not in the overlay
@@ -294,7 +305,23 @@ func (u *CopyOnWriteFs) Open(name string) (File, error) {
 
 	// If either have errors at this point something is very wrong. Return nil and the errors
 	if bErr != nil || lErr != nil {
-		return nil, fmt.Errorf("BaseErr: %v\nOverlayErr: %v", bErr, lErr)
+		// Release whichever handle was opened so a failed Open does
+		// not leak an intermediate handle.
+		if bfile != nil {
+			bfile.Close()
+		}
+		if lfile != nil {
+			lfile.Close()
+		}
+		// Keep the original errors identifiable via errors.Is/As.
+		var errs []error
+		if bErr != nil {
+			errs = append(errs, fmt.Errorf("BaseErr: %w", bErr))
+		}
+		if lErr != nil {
+			errs = append(errs, fmt.Errorf("OverlayErr: %w", lErr))
+		}
+		return nil, errors.Join(errs...)
 	}
 
 	return &UnionFile{Base: bfile, Layer: lfile}, nil

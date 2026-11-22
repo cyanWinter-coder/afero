@@ -45,6 +45,15 @@ const (
 	cacheLocal
 )
 
+var _ CapabilityReporter = (*CacheOnReadFs)(nil)
+
+// Capabilities reports the intersection of both layers' capabilities:
+// writes are forwarded to the base first and reads may hit either layer,
+// so the union never supports an operation one of its layers denies.
+func (u *CacheOnReadFs) Capabilities() Operation {
+	return CapabilitiesOf(u.base) & CapabilitiesOf(u.layer)
+}
+
 func (u *CacheOnReadFs) cacheStatus(name string) (state cacheState, fi os.FileInfo, err error) {
 	var lfi, bfi os.FileInfo
 	lfi, err = u.layer.Stat(name)
