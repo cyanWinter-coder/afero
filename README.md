@@ -192,7 +192,21 @@ dirInfo, err := afero.ReadDir(jailedFs, "/")
 
 // Attempts to access parent directories fail
 _, err = jailedFs.Open("../secrets.txt") // Returns an error
+
+// Symlinks that point outside the directory also fail
+_, err = jailedFs.Open("link-to-etc/passwd")
+if errors.Is(err, afero.ErrPathEscape) {
+    // The path resolved outside the jail.
+}
 ```
+
+`BasePathFs` normalizes every name the same way - leading separators are
+treated as the base directory, interior `.`/`..` are resolved, and escapes are
+rejected - and, when the underlying filesystem is `OsFs`, resolves symlinks
+and enforces the boundary with `os.Root`. This keeps the jail intact even if a
+path component is replaced concurrently. Lexical escapes are reported as
+`os.ErrNotExist`, matching the historical contract; a symlink that resolves
+outside the base reports `afero.ErrPathEscape`.
 
 ## Real-World Use Cases
 

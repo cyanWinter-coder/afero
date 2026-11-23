@@ -13,6 +13,14 @@ Afero is a Go filesystem abstraction library, not a sandboxed runtime or network
 - Escapes from explicit security/confinement boundaries (e.g., `BasePathFs` path traversal or `ReadOnlyFs` write bypass).
 - Unintended privilege escalation or credential exposure caused by Afero internals when used as documented.
 
+`BasePathFs` normalizes names through a single routine shared by every entry
+point (`MkdirAll`, `Rename`, `Remove`, `Open`, and the rest) and, for `OsFs`
+backed instances, resolves symlinks and enforces the root with `os.Root`.
+Symlink targets that leave the base path are rejected with `ErrPathEscape`;
+lexical `..` escapes are reported as `os.ErrNotExist`. On non-`OsFs` backends
+the boundary is enforced lexically and, when the backend exposes `Lstat` and
+`Readlink`, by resolving links inside the base path.
+
 ### Out of Scope (Open a Regular GitHub Issue)
 
 The following are treated as ordinary robustness bugs, **not** CVE-eligible security vulnerabilities:
