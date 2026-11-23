@@ -2,12 +2,15 @@ package zipfs
 
 import (
 	"archive/zip"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/spf13/afero"
+	"github.com/spf13/afero/internal/archivefs"
 )
 
 type Fs struct {
@@ -26,13 +29,63 @@ func splitpath(name string) (dir, file string) {
 	return
 }
 
+// New builds a read-only file system from an already parsed zip archive.
+//
+// Deprecated: New silently ignores entries whose names are unsafe and keeps
+// only the first entry on duplicate paths. Use [NewStrict] to get a
+// locatable, index-bound error instead; it never returns a partial index.
+// New is retained for compatibility with existing callers and delegates to
+// NewStrict, returning an empty, still usable read-only file system when the
+// archive cannot be indexed.
 func New(r *zip.Reader) afero.Fs {
+	fs, err := NewStrict(r)
+	if err != nil {
+		return &Fs{r: r, files: make(map[string]map[string]*zip.File)}
+	}
+	return fs
+}
+
+// NewStrict indexes r and returns the resulting read-only file system.
+//
+// Indexing is an all-or-nothing boundary: an entry with an absolute name,
+// a name escaping the archive root, an oversized or empty name, a duplicate
+// cleaned path, or a directory entry whose metadata cannot be read makes the
+// whole archive unusable. The returned error wraps an
+// [archivefs.EntryError] naming the offending entry (use errors.As to
+// locate it), and the returned Fs is nil so a partial index can never be
+// mistaken for a complete file system. Multiple independent indexing errors
+// are joined with errors.Join.
+//
+// The returned index is immutable after construction, so concurrent Stat,
+// Open and Close calls observe the same archive snapshot.
+func NewStrict(r *zip.Reader) (*Fs, error) {
 	fs := &Fs{r: r, files: make(map[string]map[string]*zip.File)}
+	seen := make(map[string]bool)
+	var errs []error
+
+	addError := func(entry string, err error) {
+		errs = append(errs, archivefs.EntryErrorf(entry, err))
+	}
+
 	for _, file := range r.File {
+		if err := archivefs.ValidateName(file.Name); err != nil {
+			addError(file.Name, err)
+			continue
+		}
+
+		cleaned := strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+filepath.ToSlash(file.Name))), "/")
+		if seen[cleaned] {
+			addError(file.Name, &archivefs.DuplicateEntryError{Entry: file.Name, Path: cleaned})
+			continue
+		}
+		seen[cleaned] = true
+
 		d, f := splitpath(file.Name)
 		if _, ok := fs.files[d]; !ok {
 			fs.files[d] = make(map[string]*zip.File)
 		}
+		// Only the first entry wins: never overwrite an entry that is
+		// already indexed (in practice duplicates were reported above).
 		if _, ok := fs.files[d][f]; !ok {
 			fs.files[d][f] = file
 		}
@@ -58,7 +111,11 @@ func New(r *zip.Reader) afero.Fs {
 			dv = d
 		}
 	}
-	return fs
+
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+	return fs, nil
 }
 
 func (fs *Fs) Create(name string) (afero.File, error) { return nil, syscall.EPERM }
@@ -70,7 +127,12 @@ func (fs *Fs) MkdirAll(path string, perm os.FileMode) error { return syscall.EPE
 func (fs *Fs) Open(name string) (afero.File, error) {
 	d, f := splitpath(name)
 	if f == "" {
-		return &File{fs: fs, isdir: true}, nil
+		return &File{
+			fs:    fs,
+			name:  string(filepath.Separator),
+			info:  &pseudoRoot{},
+			isdir: true,
+		}, nil
 	}
 	if _, ok := fs.files[d]; !ok {
 		return nil, &os.PathError{Op: "stat", Path: name, Err: syscall.ENOENT}
@@ -80,13 +142,24 @@ func (fs *Fs) Open(name string) (afero.File, error) {
 		return nil, &os.PathError{Op: "stat", Path: name, Err: syscall.ENOENT}
 	}
 	if file == nil {
+		pdPath := filepath.Join(d, f)
 		return &File{
 			fs:        fs,
-			pseudodir: &pseudoDir{path: filepath.Join(d, f)},
+			pseudodir: &pseudoDir{path: pdPath},
+			name:      pdPath,
+			info:      pseudoDir{path: pdPath},
 			isdir:     true,
 		}, nil
 	}
-	return &File{fs: fs, zipfile: file, isdir: file.FileInfo().IsDir()}, nil
+	info := file.FileInfo()
+	return &File{
+		fs:      fs,
+		zipfile: file,
+		name:    filepath.Join(splitpath(file.Name)),
+		info:    info,
+		size:    int64(file.UncompressedSize64),
+		isdir:   info.IsDir(),
+	}, nil
 }
 
 func (fs *Fs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
@@ -135,7 +208,7 @@ func (fs *Fs) Stat(name string) (os.FileInfo, error) {
 		return nil, &os.PathError{Op: "stat", Path: name, Err: syscall.ENOENT}
 	}
 	if file == nil {
-		return pseudoDir{name}, nil
+		return pseudoDir{path: filepath.Join(d, f)}, nil
 	}
 	return file.FileInfo(), nil
 }
