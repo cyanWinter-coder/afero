@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/afero/mem"
@@ -32,7 +33,11 @@ const chmodBits = os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky //
 type MemMapFs struct {
 	mu   sync.RWMutex
 	data map[string]*mem.FileData
-	init sync.Once
+	// version is the structural generation of the namespace. Every
+	// committed Create/Mkdir/Remove/RemoveAll/Rename bumps it exactly once;
+	// open handles record the value they were minted with.
+	version atomic.Uint64
+	init    sync.Once
 }
 
 func NewMemMapFs() Fs {
@@ -51,6 +56,23 @@ func (m *MemMapFs) getData() map[string]*mem.FileData {
 	return m.data
 }
 
+// nextVersion marks one committed structural change and returns the new
+// generation. Callers must hold m.mu (write side).
+func (m *MemMapFs) nextVersion() uint64 {
+	return m.version.Add(1)
+}
+
+// currentVersion reports the namespace generation without mutating it.
+func (m *MemMapFs) currentVersion() uint64 {
+	return m.version.Load()
+}
+
+// stampVersion records the current structural generation on a freshly
+// minted handle so the handle carries the version frozen at open time.
+func (m *MemMapFs) stampVersion(f *mem.File) *mem.File {
+	return f.WithOpenVersion(m.currentVersion())
+}
+
 func (*MemMapFs) Name() string { return "MemMapFS" }
 
 func (m *MemMapFs) Create(name string) (File, error) {
@@ -59,38 +81,74 @@ func (m *MemMapFs) Create(name string) (File, error) {
 	file := mem.CreateFile(name)
 	mem.SetMode(file, 0o666)
 	m.getData()[name] = file
-	m.registerWithParent(file, 0)
+	m.attachLocked(file, 0)
+	// Stamp inside the critical section so the handle's captured version is
+	// exactly the generation produced by this creation.
+	version := m.nextVersion()
+	handle := mem.NewFileHandle(file).WithOpenVersion(version)
 	m.mu.Unlock()
-	return mem.NewFileHandle(file), nil
+	return handle, nil
 }
 
-func (m *MemMapFs) unRegisterWithParent(fileName string) error {
-	f, err := m.lockfreeOpen(fileName)
-	if err != nil {
-		return err
-	}
+// detachLocked removes f from its parent directory's entry table. It must
+// be called with m.mu held; the parent's own mutex serializes the
+// copy-on-write map swap against directory snapshots.
+func (m *MemMapFs) detachLocked(f *mem.FileData) {
 	parent := m.findParent(f)
 	if parent == nil {
 		log.Panic("parent of ", f.Name(), " is nil")
 	}
-
 	parent.Lock()
 	mem.RemoveFromMemDir(parent, f)
 	parent.Unlock()
-	return nil
+}
+
+// attachLocked inserts f into its parent directory's entry table, creating
+// missing ancestor directories first. It must be called with m.mu held.
+func (m *MemMapFs) attachLocked(f *mem.FileData, perm os.FileMode) {
+	if f == nil {
+		return
+	}
+	parent := m.findParent(f)
+	if parent == nil {
+		pdir := filepath.Dir(filepath.Clean(f.Name()))
+		mkdirPerm := perm
+		if mkdirPerm == 0 {
+			mkdirPerm = 0o755
+		}
+		err := m.mkdirLocked(pdir, mkdirPerm)
+		if err != nil {
+			// log.Println("Mkdir error:", err)
+			return
+		}
+		parent, err = m.openLocked(pdir)
+		if err != nil {
+			// log.Println("Open after Mkdir error:", err)
+			return
+		}
+	}
+
+	parent.Lock()
+	mem.InitializeDir(parent)
+	mem.AddToMemDir(parent, f)
+	parent.Unlock()
 }
 
 func (m *MemMapFs) findParent(f *mem.FileData) *mem.FileData {
 	pdir, _ := filepath.Split(f.Name())
 	pdir = filepath.Clean(pdir)
-	pfile, err := m.lockfreeOpen(pdir)
+	pfile, err := m.openLocked(pdir)
 	if err != nil {
 		return nil
 	}
 	return pfile
 }
 
-func (m *MemMapFs) findDescendants(name string) []*mem.FileData {
+// findDescendantsLocked returns every node below name, ordered shallow
+// first so parent directories are always processed before their children.
+// The snapshot of keys is taken up front; callers hold m.mu so the map
+// cannot change while the slice is built.
+func (m *MemMapFs) findDescendantsLocked(name string) []*mem.FileData {
 	fData := m.getData()
 	descendants := make([]*mem.FileData, 0, len(fData))
 	for p, dFile := range fData {
@@ -108,36 +166,10 @@ func (m *MemMapFs) findDescendants(name string) []*mem.FileData {
 	return descendants
 }
 
-func (m *MemMapFs) registerWithParent(f *mem.FileData, perm os.FileMode) {
-	if f == nil {
-		return
-	}
-	parent := m.findParent(f)
-	if parent == nil {
-		pdir := filepath.Dir(filepath.Clean(f.Name()))
-		mkdirPerm := perm
-		if mkdirPerm == 0 {
-			mkdirPerm = 0o755
-		}
-		err := m.lockfreeMkdir(pdir, mkdirPerm)
-		if err != nil {
-			// log.Println("Mkdir error:", err)
-			return
-		}
-		parent, err = m.lockfreeOpen(pdir)
-		if err != nil {
-			// log.Println("Open after Mkdir error:", err)
-			return
-		}
-	}
-
-	parent.Lock()
-	mem.InitializeDir(parent)
-	mem.AddToMemDir(parent, f)
-	parent.Unlock()
-}
-
-func (m *MemMapFs) lockfreeMkdir(name string, perm os.FileMode) error {
+// mkdirLocked creates a directory without touching m.mu; every caller must
+// already hold the write lock. Returning ErrFileExists for a non-directory
+// path preserves the historical behavior of the old lockfree mkdir path.
+func (m *MemMapFs) mkdirLocked(name string, perm os.FileMode) error {
 	name = normalizePath(name)
 	x, ok := m.getData()[name]
 	if ok {
@@ -150,7 +182,7 @@ func (m *MemMapFs) lockfreeMkdir(name string, perm os.FileMode) error {
 		item := mem.CreateDir(name)
 		mem.SetMode(item, os.ModeDir|perm)
 		m.getData()[name] = item
-		m.registerWithParent(item, perm)
+		m.attachLocked(item, perm)
 	}
 	return nil
 }
@@ -159,26 +191,22 @@ func (m *MemMapFs) Mkdir(name string, perm os.FileMode) error {
 	perm &= chmodBits
 	name = normalizePath(name)
 
-	m.mu.RLock()
-	_, ok := m.getData()[name]
-	m.mu.RUnlock()
-	if ok {
-		return &os.PathError{Op: "mkdir", Path: name, Err: ErrFileExists}
-	}
-
 	m.mu.Lock()
-	// Dobule check that it doesn't exist.
+	defer m.mu.Unlock()
+
+	// Single critical section: existence check and insertion are atomic, so
+	// concurrent Mkdir callers cannot both pass the check and clobber one
+	// another's directory entry.
 	if _, ok := m.getData()[name]; ok {
-		m.mu.Unlock()
 		return &os.PathError{Op: "mkdir", Path: name, Err: ErrFileExists}
 	}
 	item := mem.CreateDir(name)
 	mem.SetMode(item, os.ModeDir|perm)
 	m.getData()[name] = item
-	m.registerWithParent(item, perm)
-	m.mu.Unlock()
+	m.attachLocked(item, perm)
+	m.nextVersion()
 
-	return m.setFileMode(name, perm|os.ModeDir)
+	return m.setFileModeLocked(name, perm|os.ModeDir)
 }
 
 func (m *MemMapFs) MkdirAll(path string, perm os.FileMode) error {
@@ -220,7 +248,7 @@ func (m *MemMapFs) Open(name string) (File, error) {
 		if mem.GetFileInfo(f).Mode().Perm()&0o444 == 0 {
 			return nil, &os.PathError{Op: "open", Path: name, Err: os.ErrPermission}
 		}
-		return mem.NewReadOnlyFileHandle(f), err
+		return m.stampVersion(mem.NewReadOnlyFileHandle(f)), err
 	}
 	return nil, err
 }
@@ -232,7 +260,7 @@ func (m *MemMapFs) openWrite(name string) (File, error) {
 		if mem.GetFileInfo(f).Mode().Perm()&0o222 == 0 {
 			return nil, &os.PathError{Op: "open", Path: name, Err: os.ErrPermission}
 		}
-		return mem.NewFileHandle(f), err
+		return m.stampVersion(mem.NewFileHandle(f)), err
 	}
 	return nil, err
 }
@@ -249,14 +277,14 @@ func (m *MemMapFs) open(name string) (*mem.FileData, error) {
 	return f, nil
 }
 
-func (m *MemMapFs) lockfreeOpen(name string) (*mem.FileData, error) {
+// openLocked looks up a node while m.mu is already held (either side).
+func (m *MemMapFs) openLocked(name string) (*mem.FileData, error) {
 	name = normalizePath(name)
 	f, ok := m.getData()[name]
 	if ok {
 		return f, nil
-	} else {
-		return nil, ErrFileNotFound
 	}
+	return nil, ErrFileNotFound
 }
 
 func (m *MemMapFs) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
@@ -274,7 +302,7 @@ func (m *MemMapFs) OpenFile(name string, flag int, perm os.FileMode) (File, erro
 		return nil, err
 	}
 	if flag == os.O_RDONLY {
-		file = mem.NewReadOnlyFileHandle(file.(*mem.File).Data())
+		file = m.stampVersion(mem.NewReadOnlyFileHandle(file.(*mem.File).Data()))
 	}
 	if flag&os.O_APPEND > 0 {
 		_, err = file.Seek(0, io.SeekEnd)
@@ -302,36 +330,49 @@ func (m *MemMapFs) Remove(name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, ok := m.getData()[name]; ok {
-		err := m.unRegisterWithParent(name)
-		if err != nil {
-			return &os.PathError{Op: "remove", Path: name, Err: err}
-		}
-		delete(m.getData(), name)
-	} else {
+	node, ok := m.getData()[name]
+	if !ok {
 		return &os.PathError{Op: "remove", Path: name, Err: os.ErrNotExist}
 	}
+	m.detachLocked(node)
+	delete(m.getData(), name)
+	m.nextVersion()
 	return nil
 }
 
 func (m *MemMapFs) RemoveAll(path string) error {
 	path = normalizePath(path)
+
 	m.mu.Lock()
-	m.unRegisterWithParent(path)
-	m.mu.Unlock()
+	defer m.mu.Unlock()
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	data := m.getData()
 
-	for p := range m.getData() {
+	// Snapshot everything that belongs to the subtree, then mutate: no map
+	// entry can be added or removed between the decision and the deletion,
+	// and concurrent readers either see the complete old subtree or none of
+	// it. Nodes whose parent is removed in the same sweep need no parent
+	// table update of their own.
+	removing := make(map[string]bool)
+	for p := range data {
 		if p == path || strings.HasPrefix(p, path+FilePathSeparator) {
-			m.mu.RUnlock()
-			m.mu.Lock()
-			delete(m.getData(), p)
-			m.mu.Unlock()
-			m.mu.RLock()
+			removing[p] = true
 		}
 	}
+	if len(removing) == 0 {
+		// os.RemoveAll treats a missing target as success.
+		return nil
+	}
+
+	for p := range removing {
+		node := data[p]
+		parentPath := filepath.Clean(filepath.Dir(p))
+		if !removing[parentPath] {
+			m.detachLocked(node)
+		}
+		delete(data, p)
+	}
+	m.nextVersion()
 	return nil
 }
 
@@ -343,56 +384,105 @@ func (m *MemMapFs) Rename(oldname, newname string) error {
 		return nil
 	}
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if _, ok := m.getData()[oldname]; ok {
-		m.mu.RUnlock()
-		m.mu.Lock()
-		err := m.unRegisterWithParent(oldname)
-		if err != nil {
-			return err
-		}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-		fileData := m.getData()[oldname]
-		mem.ChangeFileName(fileData, newname)
-		m.getData()[newname] = fileData
-
-		err = m.renameDescendants(oldname, newname)
-		if err != nil {
-			return err
-		}
-
-		delete(m.getData(), oldname)
-
-		m.registerWithParent(fileData, 0)
-		m.mu.Unlock()
-		m.mu.RLock()
-	} else {
+	data := m.getData()
+	root, ok := data[oldname]
+	if !ok {
 		return &os.PathError{Op: "rename", Path: oldname, Err: ErrFileNotFound}
 	}
-	return nil
-}
 
-func (m *MemMapFs) renameDescendants(oldname, newname string) error {
-	descendants := m.findDescendants(oldname)
-	removes := make([]string, 0, len(descendants))
-	for _, desc := range descendants {
-		descNewName := strings.Replace(desc.Name(), oldname, newname, 1)
-		err := m.unRegisterWithParent(desc.Name())
-		if err != nil {
-			return err
+	// Moving a directory below itself ("/a" -> "/a/b") would create an
+	// unreachable cycle; reject it before touching any entry table.
+	if strings.HasPrefix(newname, oldname+FilePathSeparator) {
+		return &os.PathError{
+			Op:   "rename",
+			Path: newname,
+			Err:  os.ErrInvalid,
 		}
-
-		removes = append(removes, desc.Name())
-		mem.ChangeFileName(desc, descNewName)
-		m.getData()[descNewName] = desc
-
-		m.registerWithParent(desc, 0)
-	}
-	for _, r := range removes {
-		delete(m.getData(), r)
 	}
 
+	// Validate the destination parent up front, while no mutation has
+	// happened. attachLocked would otherwise try to create a missing parent
+	// while this call already holds the write lock.
+	newParentPath := filepath.Clean(filepath.Dir(newname))
+	if _, err := m.openLocked(newParentPath); err != nil {
+		return &os.PathError{Op: "rename", Path: newname, Err: err}
+	}
+
+	// Phase 1: plan every key move against the immutable current view.
+	type move struct {
+		node                   *mem.FileData
+		oldName, newName       string
+		oldParent, newParent   string
+		parentMovesWithSubtree bool
+		sameParent             bool
+	}
+	planMoves := func() []move {
+		out := []move{{
+			node:       root,
+			oldName:    oldname,
+			newName:    newname,
+			oldParent:  filepath.Clean(filepath.Dir(oldname)),
+			newParent:  newParentPath,
+			sameParent: filepath.Clean(filepath.Dir(oldname)) == newParentPath,
+		}}
+		for _, desc := range m.findDescendantsLocked(oldname) {
+			from := desc.Name()
+			to := strings.Replace(from, oldname, newname, 1)
+			oldParent := filepath.Clean(filepath.Dir(from))
+			newParent := filepath.Clean(filepath.Dir(to))
+			out = append(out, move{
+				node:                   desc,
+				oldName:                from,
+				newName:                to,
+				oldParent:              oldParent,
+				newParent:              newParent,
+				parentMovesWithSubtree: strings.HasPrefix(oldParent, oldname+FilePathSeparator),
+				sameParent:             oldParent == newParent,
+			})
+		}
+		return out
+	}
+	moves := planMoves()
+
+	// Phase 2: detach every moved node from its old parent table. Nodes
+	// inside the moved subtree keep their table relationships, since the
+	// whole parent table moves with them; same-parent renames are handled by
+	// an atomic key replace in phase 4 and must not detach here.
+	for _, mv := range moves {
+		if !mv.parentMovesWithSubtree && !mv.sameParent {
+			m.detachLocked(mv.node)
+		}
+	}
+
+	// Phase 3: repoint the namespace keys and the inode path labels.
+	for _, mv := range moves {
+		mem.ChangeFileName(mv.node, mv.newName)
+		data[mv.newName] = mv.node
+		delete(data, mv.oldName)
+	}
+
+	// Phase 4: update the parent entry tables. A same-parent rename swaps
+	// the key in one copy-on-write operation (atomic, no transient gap);
+	// cross-parent moves attach into the new parent's table.
+	for _, mv := range moves {
+		if mv.parentMovesWithSubtree {
+			continue
+		}
+		parent := data[mv.newParent]
+		parent.Lock()
+		if mv.sameParent {
+			mem.ReplaceInMemDir(parent, mv.oldName, mv.newName, mv.node)
+		} else {
+			mem.InitializeDir(parent)
+			mem.AddToMemDir(parent, mv.node)
+		}
+		parent.Unlock()
+	}
+
+	m.nextVersion()
 	return nil
 }
 
@@ -426,6 +516,18 @@ func (m *MemMapFs) Chmod(name string, mode os.FileMode) error {
 	return m.setFileMode(name, mode)
 }
 
+// setFileModeLocked changes mode bits while m.mu is already held.
+func (m *MemMapFs) setFileModeLocked(name string, mode os.FileMode) error {
+	name = normalizePath(name)
+	f, ok := m.getData()[name]
+	if !ok {
+		return &os.PathError{Op: "chmod", Path: name, Err: ErrFileNotFound}
+	}
+
+	mem.SetMode(f, mode)
+	return nil
+}
+
 func (m *MemMapFs) setFileMode(name string, mode os.FileMode) error {
 	name = normalizePath(name)
 
@@ -437,9 +539,8 @@ func (m *MemMapFs) setFileMode(name string, mode os.FileMode) error {
 	}
 
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	mem.SetMode(f, mode)
-	m.mu.Unlock()
-
 	return nil
 }
 

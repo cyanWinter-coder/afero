@@ -32,6 +32,11 @@ const FilePathSeparator = string(filepath.Separator)
 
 var _ fs.ReadDirFile = &File{}
 
+// nextInodeID hands out immutable inode identities. A rename changes the
+// path of a FileData but never its id, so open handles can keep referring to
+// the same inode after it has moved or been unlinked.
+var nextInodeID atomic.Uint64
+
 type File struct {
 	// atomic requires 64-bit alignment for struct field access
 	at           int64
@@ -40,15 +45,58 @@ type File struct {
 	readOnly     bool
 	dirBuf       []*FileData
 	fileData     *FileData
+
+	// Identity and structural version frozen when the handle was opened.
+	// inodeID never changes for the underlying inode; openedVersion is the
+	// namespace generation of the open and is stamped by the owning
+	// filesystem via WithOpenVersion (zero for bare mem-package handles);
+	// openedName is the path the handle was created at, matching os.File.
+	inodeID       uint64
+	openedVersion uint64
+	openedName    string
 }
 
+// NewFileHandle mints a read/write handle over data and freezes the inode
+// identity and opening path on the handle.
 func NewFileHandle(data *FileData) *File {
-	return &File{fileData: data}
+	return newHandle(data, false)
 }
 
 func NewReadOnlyFileHandle(data *FileData) *File {
-	return &File{fileData: data, readOnly: true}
+	return newHandle(data, true)
 }
+
+func newHandle(data *FileData, readOnly bool) *File {
+	data.Lock()
+	name := data.name
+	id := data.id
+	data.Unlock()
+	return &File{
+		fileData:   data,
+		readOnly:   readOnly,
+		inodeID:    id,
+		openedName: name,
+	}
+}
+
+// WithOpenVersion returns a copy of the handle carrying the filesystem's
+// current structural version. MemMapFs calls this after every successful
+// open so each handle records the namespace generation it belongs to; the
+// handle offset and read/close state are unaffected.
+func (f *File) WithOpenVersion(version uint64) *File {
+	f.openedVersion = version
+	return f
+}
+
+// InodeID reports the immutable inode identity captured at open time.
+func (f *File) InodeID() uint64 { return f.inodeID }
+
+// OpenVersion reports the namespace structural version captured at open time.
+func (f *File) OpenVersion() uint64 { return f.openedVersion }
+
+// OpenedName reports the path the handle was opened with. Unlike the
+// underlying FileData, it does not change when the inode is renamed.
+func (f *File) OpenedName() string { return f.openedName }
 
 func (f File) Data() *FileData {
 	return f.fileData
@@ -56,6 +104,9 @@ func (f File) Data() *FileData {
 
 type FileData struct {
 	sync.Mutex
+	// id is the immutable inode identity, assigned on creation and preserved
+	// across rename and unlink while any handle still references the data.
+	id      uint64
 	name    string
 	data    []byte
 	memDir  Dir
@@ -66,6 +117,13 @@ type FileData struct {
 	gid     int
 }
 
+// InodeID returns the immutable identity of the inode described by d.
+func (d *FileData) InodeID() uint64 {
+	d.Lock()
+	defer d.Unlock()
+	return d.id
+}
+
 func (d *FileData) Name() string {
 	d.Lock()
 	defer d.Unlock()
@@ -73,11 +131,22 @@ func (d *FileData) Name() string {
 }
 
 func CreateFile(name string) *FileData {
-	return &FileData{name: name, mode: os.ModeTemporary, modtime: time.Now()}
+	return &FileData{
+		id:      nextInodeID.Add(1),
+		name:    name,
+		mode:    os.ModeTemporary,
+		modtime: time.Now(),
+	}
 }
 
 func CreateDir(name string) *FileData {
-	return &FileData{name: name, memDir: &DirMap{}, dir: true, modtime: time.Now()}
+	return &FileData{
+		id:      nextInodeID.Add(1),
+		name:    name,
+		memDir:  &DirMap{},
+		dir:     true,
+		modtime: time.Now(),
+	}
 }
 
 func ChangeFileName(f *FileData, newname string) {
@@ -124,6 +193,9 @@ func (f *File) Open() error {
 	f.fileData.Lock()
 	f.dirBuf = nil
 	f.closed = false
+	// Re-opening re-freezes the handle against the inode's current path.
+	f.openedName = f.fileData.name
+	f.inodeID = f.fileData.id
 	f.fileData.Unlock()
 	return nil
 }
@@ -141,8 +213,10 @@ func (f *File) Close() error {
 	return nil
 }
 
+// Name returns the path the handle was opened with. Renaming the inode does
+// not change an already-open handle's name, matching os.File.
 func (f *File) Name() string {
-	return f.fileData.Name()
+	return f.openedName
 }
 
 func (f *File) Stat() (os.FileInfo, error) {
@@ -157,17 +231,21 @@ func (f *File) Readdir(count int) (res []os.FileInfo, err error) {
 	if !f.fileData.dir {
 		return nil, &os.PathError{
 			Op:   "readdir",
-			Path: f.fileData.name,
+			Path: f.openedName,
 			Err:  errors.New("not a dir"),
 		}
 	}
 	var outLength int64
 
 	f.fileData.Lock()
+	// The first call snapshots the directory table copy-on-write; every
+	// subsequent paginated call on this handle walks the same immutable
+	// snapshot, so entries cannot appear twice or vanish mid-walk even if
+	// the directory is renamed or its children are removed concurrently.
 	if f.dirBuf == nil {
 		f.dirBuf = f.fileData.memDir.Files()
 	}
-	files := f.dirBuf[f.readDirCount:]
+	files := f.dirBuf[atomic.LoadInt64(&f.readDirCount):]
 	if count > 0 {
 		if len(files) < count {
 			outLength = int64(len(files))
@@ -180,7 +258,7 @@ func (f *File) Readdir(count int) (res []os.FileInfo, err error) {
 	} else {
 		outLength = int64(len(files))
 	}
-	f.readDirCount += outLength
+	atomic.AddInt64(&f.readDirCount, outLength)
 	f.fileData.Unlock()
 
 	res = make([]os.FileInfo, outLength)
@@ -253,7 +331,7 @@ func (f *File) Truncate(size int64) error {
 	if f.readOnly {
 		return &os.PathError{
 			Op:   "truncate",
-			Path: f.fileData.name,
+			Path: f.openedName,
 			Err:  errors.New("file handle is read only"),
 		}
 	}
@@ -282,7 +360,10 @@ func (f *File) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekCurrent:
 		atomic.AddInt64(&f.at, offset)
 	case io.SeekEnd:
-		atomic.StoreInt64(&f.at, int64(len(f.fileData.data))+offset)
+		f.fileData.Lock()
+		size := int64(len(f.fileData.data))
+		f.fileData.Unlock()
+		atomic.StoreInt64(&f.at, size+offset)
 	}
 	return f.at, nil
 }
@@ -294,7 +375,7 @@ func (f *File) WriteAt(b []byte, off int64) (n int, err error) {
 	if f.readOnly {
 		return 0, &os.PathError{
 			Op:   "write",
-			Path: f.fileData.name,
+			Path: f.openedName,
 			Err:  errors.New("file handle is read only"),
 		}
 	}
